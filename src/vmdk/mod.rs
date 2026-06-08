@@ -514,7 +514,9 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Vmdk<S, F> {
             .binary_search_by(|extent| {
                 if extent.disk_range.contains(&offset) {
                     cmp::Ordering::Equal
-                } else if extent.disk_range.end < offset {
+                } else if extent.disk_range.end <= offset {
+                    // disk_range is half-open [start, end); use <= so that
+                    // end == offset returns Less, not Greater.
                     cmp::Ordering::Less
                 } else {
                     cmp::Ordering::Greater

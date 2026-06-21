@@ -100,6 +100,115 @@ pub enum Mapping<'a, S: Storage + 'static> {
     },
 }
 
+/// Resolved read plan for a disk image range.
+///
+/// A read plan describes how a requested image range maps to storage ranges, zero-filled ranges,
+/// end-of-file ranges, or special format-driver ranges. It does not issue I/O and does not
+/// allocate or modify image metadata.
+#[derive(Debug)]
+pub struct FormatReadPlan<'a, S: Storage + 'static> {
+    /// Requested read length in bytes.
+    len: u64,
+
+    /// Ordered steps covering the requested range.
+    steps: Vec<FormatReadPlanStep<'a, S>>,
+}
+
+/// One step in a [`FormatReadPlan`].
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum FormatReadPlanStep<'a, S: Storage + 'static> {
+    /// Range that can be read directly from a storage object.
+    #[non_exhaustive]
+    Raw {
+        /// Storage object where this data is stored.
+        storage: &'a S,
+
+        /// Offset in `storage` where this data is stored.
+        offset: u64,
+
+        /// Offset in the requested image where this step starts.
+        image_offset: u64,
+
+        /// Length of this step in bytes.
+        len: u64,
+
+        /// Whether this raw mapping may be written to directly.
+        writable: bool,
+    },
+
+    /// Range that should be returned as zeroes.
+    #[non_exhaustive]
+    Zero {
+        /// Offset in the requested image where this step starts.
+        image_offset: u64,
+
+        /// Length of this step in bytes.
+        len: u64,
+
+        /// Whether these zeroes are explicit on the top format layer.
+        explicit: bool,
+    },
+
+    /// Range beyond the image's top-layer end of file.
+    ///
+    /// Normal reads fill this range with zeroes.
+    #[non_exhaustive]
+    Eof {
+        /// Offset in the requested image where this step starts.
+        image_offset: u64,
+
+        /// Length of this step in bytes.
+        len: u64,
+    },
+
+    /// Range that must be interpreted by the image format driver.
+    #[non_exhaustive]
+    Special {
+        /// Format layer where this special data was encountered.
+        layer: &'a FormatAccess<S>,
+
+        /// Original offset on `layer` to pass to `readv_special()`.
+        offset: u64,
+
+        /// Offset in the requested image where this step starts.
+        image_offset: u64,
+
+        /// Length of this step in bytes.
+        len: u64,
+    },
+}
+
+impl<'a, S: Storage + 'static> FormatReadPlan<'a, S> {
+    /// Create an empty read plan for a request of `len` bytes.
+    fn new(len: u64) -> Self {
+        FormatReadPlan {
+            len,
+            steps: Vec::new(),
+        }
+    }
+
+    /// Add a step to the read plan.
+    fn push(&mut self, step: FormatReadPlanStep<'a, S>) {
+        self.steps.push(step);
+    }
+
+    /// Return the requested read length in bytes.
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// Return whether this plan covers an empty request.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Return the ordered steps covering the requested range.
+    pub fn steps(&self) -> &[FormatReadPlanStep<'a, S>] {
+        &self.steps
+    }
+}
+
 // When adding new public methods, don’t forget to add them to sync_wrappers, too.
 impl<S: Storage + 'static> FormatAccess<S> {
     /// Wrap a format driver instance in `FormatAccess`.
@@ -305,6 +414,78 @@ impl<S: Storage + 'static> FormatAccess<S> {
                 }
             }
         }
+    }
+
+    /// Plan a read without issuing storage I/O.
+    ///
+    /// The returned plan covers `length` bytes starting at `offset`, matching the behavior of
+    /// [`FormatAccess::readv()`]: raw ranges point at the underlying storage object, zero ranges
+    /// should be filled with zeroes, EOF ranges should also be filled with zeroes, and special
+    /// ranges must be read through the format driver.
+    pub async fn plan_read(
+        &self,
+        mut offset: u64,
+        mut length: u64,
+    ) -> io::Result<FormatReadPlan<'_, S>> {
+        offset.checked_add(length).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "Read plan range overflow")
+        })?;
+
+        let requested_length = length;
+        let mut plan = FormatReadPlan::new(requested_length);
+
+        while length > 0 {
+            let (mapping, mapped_length) = self.get_mapping(offset, length).await?;
+            if mapped_length == 0 {
+                assert!(mapping.is_eof());
+                plan.push(FormatReadPlanStep::Eof {
+                    image_offset: offset,
+                    len: length,
+                });
+                break;
+            }
+
+            let step_length = cmp::min(mapped_length, length);
+            match mapping {
+                Mapping::Raw {
+                    storage,
+                    offset: storage_offset,
+                    writable,
+                } => plan.push(FormatReadPlanStep::Raw {
+                    storage,
+                    offset: storage_offset,
+                    image_offset: offset,
+                    len: step_length,
+                    writable,
+                }),
+
+                Mapping::Zero { explicit } => plan.push(FormatReadPlanStep::Zero {
+                    image_offset: offset,
+                    len: step_length,
+                    explicit,
+                }),
+
+                Mapping::Eof {} => plan.push(FormatReadPlanStep::Eof {
+                    image_offset: offset,
+                    len: step_length,
+                }),
+
+                Mapping::Special {
+                    layer,
+                    offset: special_offset,
+                } => plan.push(FormatReadPlanStep::Special {
+                    layer,
+                    offset: special_offset,
+                    image_offset: offset,
+                    len: step_length,
+                }),
+            }
+
+            offset += step_length;
+            length -= step_length;
+        }
+
+        Ok(plan)
     }
 
     /// Create a raw data mapping at `offset`.
@@ -900,6 +1081,83 @@ impl<S: Storage> Display for Mapping<'_, S> {
                 write!(f, "<special:{layer}:0x{offset:x}>")
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FormatAccess, FormatReadPlanStep};
+    use crate::null::Null;
+    use crate::raw::Raw;
+    use std::io;
+
+    #[test]
+    fn raw_read_plan_exposes_storage_extent() -> io::Result<()> {
+        let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+
+        runtime.block_on(async {
+            let raw = Raw::open_image(Null::new(4096), true).await?;
+            let image = FormatAccess::new(raw);
+            let plan = image.plan_read(512, 1024).await?;
+
+            assert_eq!(plan.len(), 1024);
+            assert!(!plan.is_empty());
+            assert_eq!(plan.steps().len(), 1);
+
+            match &plan.steps()[0] {
+                FormatReadPlanStep::Raw {
+                    offset,
+                    image_offset,
+                    len,
+                    ..
+                } => {
+                    assert_eq!(*offset, 512);
+                    assert_eq!(*image_offset, 512);
+                    assert_eq!(*len, 1024);
+                }
+                step => panic!("expected raw step, got {step:?}"),
+            }
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn raw_read_plan_marks_eof_tail() -> io::Result<()> {
+        let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+
+        runtime.block_on(async {
+            let raw = Raw::open_image(Null::new(4096), true).await?;
+            let image = FormatAccess::new(raw);
+            let plan = image.plan_read(3072, 2048).await?;
+
+            assert_eq!(plan.len(), 2048);
+            assert_eq!(plan.steps().len(), 2);
+
+            match &plan.steps()[0] {
+                FormatReadPlanStep::Raw {
+                    offset,
+                    image_offset,
+                    len,
+                    ..
+                } => {
+                    assert_eq!(*offset, 3072);
+                    assert_eq!(*image_offset, 3072);
+                    assert_eq!(*len, 1024);
+                }
+                step => panic!("expected raw step, got {step:?}"),
+            }
+
+            match &plan.steps()[1] {
+                FormatReadPlanStep::Eof { image_offset, len } => {
+                    assert_eq!(*image_offset, 4096);
+                    assert_eq!(*len, 1024);
+                }
+                step => panic!("expected eof step, got {step:?}"),
+            }
+
+            Ok(())
+        })
     }
 }
 

@@ -107,7 +107,7 @@ pub mod storage;
 mod vector_select;
 pub mod vmdk;
 
-pub use format::access::{FormatAccess, Mapping};
+pub use format::access::{FormatAccess, FormatReadPlan, FormatReadPlanStep, Mapping};
 pub use format::builder::{FormatCreateBuilder, FormatDriverBuilder};
 pub use format::drivers::ShallowMapping;
 pub use format::gate::{DenyImplicitOpenGate, PermissiveImplicitOpenGate};

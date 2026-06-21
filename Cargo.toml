@@ -1,11 +1,14 @@
 [package]
-name = "imago"
-version = "0.2.3"
+name = "msb-krun-imago"
+version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "A library for accessing virtual machine disk images."
-repository = "https://gitlab.com/hreitz/imago"
+repository = "https://github.com/superradcompany/imago"
 readme = "README.md"
+
+[lib]
+name = "imago"
 
 [dependencies]
 async-trait = "0.1"

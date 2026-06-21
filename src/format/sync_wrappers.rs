@@ -3,7 +3,7 @@
 use super::drivers::FormatDriverInstance;
 use super::PreallocateMode;
 use crate::io_buffers::{IoVector, IoVectorMut};
-use crate::{FormatAccess, Mapping, Storage};
+use crate::{FormatAccess, FormatReadPlan, Mapping, Storage};
 use std::io;
 
 /// Synchronous wrapper around [`FormatAccess`].
@@ -88,6 +88,13 @@ impl<S: Storage + 'static> SyncFormatAccess<S> {
     ) -> io::Result<(Mapping<'_, S>, u64)> {
         self.runtime
             .block_on(self.inner.get_mapping(offset, max_length))
+    }
+
+    /// Plan a read without issuing storage I/O.
+    ///
+    /// See [`FormatAccess::plan_read()`].
+    pub fn plan_read(&self, offset: u64, length: u64) -> io::Result<FormatReadPlan<'_, S>> {
+        self.runtime.block_on(self.inner.plan_read(offset, length))
     }
 
     /// Create a raw data mapping at `offset`.

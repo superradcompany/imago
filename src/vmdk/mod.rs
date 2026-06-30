@@ -33,7 +33,7 @@ enum VmdkStorage<S: Storage + 'static> {
     Flat {
         /// Storage object containing linear (raw) data
         file: S,
-        /// Offset in `file` where the data for this extent begins
+        /// Byte offset in `file` where the data for this extent begins
         offset: u64,
     },
     /// A zero-filled extent
@@ -47,7 +47,8 @@ enum VmdkParsedStorage {
     Flat {
         /// Path to storage object containing linear (raw) data
         filename: String,
-        /// Offset in the storage object where the data for this extent begins
+        /// Offset, in 512-byte sectors (as written in the VMDK descriptor), where
+        /// the data for this extent begins in the storage object
         offset: u64,
     },
     /// A zero-filled extent
@@ -303,7 +304,13 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Vmdk<S, F> {
 
                 VmdkStorage::Flat {
                     file,
-                    offset: *offset,
+                    // The FLAT offset is in 512-byte sectors (like the extent length);
+                    // scale it to bytes to match the byte-based `disk_range`.
+                    offset: (*offset).checked_mul(VMDK_SECTOR_SIZE).ok_or_else(|| {
+                        invalid_data(format!(
+                            "Extent offset overflow: {offset} * {VMDK_SECTOR_SIZE}"
+                        ))
+                    })?,
                 }
             }
 
@@ -741,5 +748,75 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> FormatDriverBuilder<S>
 
     fn get_storage_open_options(&self) -> Option<&StorageOpenOptions> {
         self.0.get_storage_opts()
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::Vmdk;
+    use crate::file::File;
+    use crate::format::access::{FormatAccess, FormatReadPlanStep};
+    use crate::{FormatDriverBuilder, PermissiveImplicitOpenGate};
+    use std::io;
+
+    /// A FLAT extent's offset is in 512-byte sectors, so a nonzero-offset extent (the
+    /// 2nd+ slice of a >2 GiB file) must resolve to byte `offset * 512`, not `offset`.
+    #[test]
+    fn flat_nonzero_offset_is_scaled_sectors_to_bytes() -> io::Result<()> {
+        let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+        runtime.block_on(async {
+            // No `tempfile` dev-dependency; use a pid-unique scratch dir.
+            let dir = std::env::temp_dir().join(format!("imago_vmdk_off_{}", std::process::id()));
+            std::fs::create_dir_all(&dir)?;
+            let flat_path = dir.join("layer.flat");
+            let desc_path = dir.join("disk.vmdk");
+
+            // 4-sector (2048-byte) backing file is enough for two 2-sector extents.
+            std::fs::write(&flat_path, vec![0u8; 4 * 512])?;
+
+            // Two FLAT extents into one file; the 2nd at a nonzero sector offset (2).
+            let desc = "# Disk DescriptorFile\n\
+                version=1\n\
+                CID=fffffffe\n\
+                parentCID=ffffffff\n\
+                createType=\"twoGbMaxExtentFlat\"\n\
+                \n\
+                RW 2 FLAT \"layer.flat\" 0\n\
+                RW 2 FLAT \"layer.flat\" 2\n\
+                \n\
+                ddb.geometry.cylinders = \"1\"\n\
+                ddb.geometry.heads = \"16\"\n\
+                ddb.geometry.sectors = \"63\"\n";
+            std::fs::write(&desc_path, desc)?;
+
+            let vmdk = Vmdk::<File>::builder_path(&desc_path)
+                .open(PermissiveImplicitOpenGate::default())
+                .await?;
+            let image = FormatAccess::new(vmdk);
+
+            // Resolve a read at the start of the 2nd extent (virtual offset 1024).
+            let plan = image.plan_read(1024, 512).await?;
+            let steps = plan.steps();
+            assert!(!steps.is_empty(), "expected a read step, got none");
+            // Assert on `offset` (resolved backing offset), not `image_offset`
+            // (the virtual offset, which is 1024 regardless of the bug).
+            let storage_offset = match &steps[0] {
+                FormatReadPlanStep::Raw { offset, .. } => *offset,
+                step => panic!("expected a Raw step, got {step:?}"),
+            };
+
+            // 2 sectors * 512 = 1024 (the bug yielded the raw sector value, 2).
+            assert_eq!(
+                storage_offset, 1024,
+                "FLAT offset must be scaled sectors->bytes; got {storage_offset}"
+            );
+
+            std::fs::remove_dir_all(&dir).ok();
+            Ok(())
+        })
     }
 }

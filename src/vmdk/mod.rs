@@ -33,7 +33,7 @@ enum VmdkStorage<S: Storage + 'static> {
     Flat {
         /// Storage object containing linear (raw) data
         file: S,
-        /// Offset in `file` where the data for this extent begins
+        /// Byte offset in `file` where the data for this extent begins
         offset: u64,
     },
     /// A zero-filled extent
@@ -47,7 +47,7 @@ enum VmdkParsedStorage {
     Flat {
         /// Path to storage object containing linear (raw) data
         filename: String,
-        /// Offset in the storage object where the data for this extent begins
+        /// Offset, in 512-byte sectors, where the data for this extent begins
         offset: u64,
     },
     /// A zero-filled extent
@@ -304,7 +304,13 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Vmdk<S, F> {
 
                 VmdkStorage::Flat {
                     file,
-                    offset: *offset,
+                    // FLAT descriptors express both length and offset in 512-byte sectors, while
+                    // mappings and storage access use byte offsets.
+                    offset: (*offset).checked_mul(VMDK_SECTOR_SIZE).ok_or_else(|| {
+                        invalid_data(format!(
+                            "Extent offset overflow: {offset} * {VMDK_SECTOR_SIZE}"
+                        ))
+                    })?,
                 }
             }
 
@@ -745,5 +751,54 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> FormatDriverBuilder<S>
 
     fn get_storage_open_options(&self) -> Option<&StorageOpenOptions> {
         self.0.get_storage_opts()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Vmdk, VMDK_SECTOR_SIZE};
+    use crate::file::File;
+    use crate::{
+        FormatAccess, FormatDriverBuilder, FormatReadPlanStep, PermissiveImplicitOpenGate,
+    };
+    use std::io;
+
+    #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+    async fn flat_nonzero_offset_is_scaled_sectors_to_bytes() -> io::Result<()> {
+        let dir = std::env::temp_dir().join(format!("imago_vmdk_off_{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let flat_path = dir.join("layer.flat");
+        let desc_path = dir.join("disk.vmdk");
+
+        // Two small extents are sufficient to exercise a nonzero FLAT backing-file offset.
+        std::fs::write(&flat_path, vec![0u8; 4 * VMDK_SECTOR_SIZE as usize])?;
+        let descriptor = "# Disk DescriptorFile\n\
+            version=1\n\
+            CID=fffffffe\n\
+            parentCID=ffffffff\n\
+            createType=\"twoGbMaxExtentFlat\"\n\
+            RW 2 FLAT \"layer.flat\" 0\n\
+            RW 2 FLAT \"layer.flat\" 2\n\
+            ddb.geometry.cylinders = \"1\"\n\
+            ddb.geometry.heads = \"16\"\n\
+            ddb.geometry.sectors = \"63\"\n";
+        std::fs::write(&desc_path, descriptor)?;
+
+        let vmdk = Vmdk::<File>::builder_path(&desc_path)
+            .open(PermissiveImplicitOpenGate::default())
+            .await?;
+        let image = FormatAccess::new(vmdk);
+        let plan = image
+            .plan_read(2 * VMDK_SECTOR_SIZE, VMDK_SECTOR_SIZE)
+            .await?;
+
+        let storage_offset = match &plan.steps()[0] {
+            FormatReadPlanStep::Raw { offset, .. } => *offset,
+            step => panic!("expected a raw step, got {step:?}"),
+        };
+        assert_eq!(storage_offset, 2 * VMDK_SECTOR_SIZE);
+
+        std::fs::remove_dir_all(&dir).ok();
+        Ok(())
     }
 }

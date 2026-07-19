@@ -280,6 +280,11 @@ impl<S: Storage + 'static> SyncFormatAccess<S> {
         self.runtime.block_on(self.inner.sync())
     }
 
+    /// Sync data with the narrowest durability primitive supported by the active format.
+    pub fn sync_data(&self) -> io::Result<()> {
+        self.runtime.block_on(self.inner.sync_data())
+    }
+
     /// Drop internal buffers.
     ///
     /// This drops all internal buffers, but does not flush them!  All cached data is reloaded from

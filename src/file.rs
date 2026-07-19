@@ -325,6 +325,10 @@ impl Storage for File {
         self.file.write().unwrap().sync_all()
     }
 
+    async fn sync_data(&self) -> io::Result<()> {
+        self.file.write().unwrap().sync_data()
+    }
+
     async unsafe fn invalidate_cache(&self) -> io::Result<()> {
         // TODO: Figure out what to do.  Generally, `std::fs::File` does not have internal buffers,
         // so we don’t need to invalidate anything; we could close and reopen, but that would still

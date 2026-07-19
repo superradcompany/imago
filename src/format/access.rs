@@ -1003,6 +1003,14 @@ impl<S: Storage + 'static> FormatAccess<S> {
         self.inner.sync().await
     }
 
+    /// Sync data with the narrowest durability primitive supported by the active format.
+    ///
+    /// Formats with durability-critical metadata retain full sync semantics; raw files can use a
+    /// data-only barrier.
+    pub async fn sync_data(&self) -> io::Result<()> {
+        self.inner.sync_data().await
+    }
+
     /// Drop internal buffers.
     ///
     /// This drops all internal buffers, but does not flush them!  All cached data is reloaded from

@@ -267,6 +267,14 @@ pub trait FormatDriverInstance: Any + Debug + Display + Send + Sync {
     /// through to `Storage::sync()` for all underlying storage objects.
     async fn sync(&self) -> io::Result<()>;
 
+    /// Sync data without requiring unrelated inode metadata durability.
+    ///
+    /// Formats that cannot distinguish data from required format metadata retain the stronger
+    /// sync behavior by default. Raw storage can safely pass the narrower request through.
+    async fn sync_data(&self) -> io::Result<()> {
+        self.sync().await
+    }
+
     /// Drop internal buffers.
     ///
     /// Drop all internal buffers, but do not flush them!  All internal data must then be reloaded

@@ -219,6 +219,10 @@ impl<S: Storage + 'static> FormatDriverInstance for Raw<S> {
         self.inner.sync().await
     }
 
+    async fn sync_data(&self) -> io::Result<()> {
+        self.inner.sync_data().await
+    }
+
     async unsafe fn invalidate_cache(&self) -> io::Result<()> {
         // No internal buffers to drop
         // Safe: Caller says we should do this

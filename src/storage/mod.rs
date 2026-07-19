@@ -261,6 +261,15 @@ pub trait Storage: Debug + Display + Send + Sized + Sync {
     #[allow(async_fn_in_trait)] // No need for Send
     async fn sync(&self) -> io::Result<()>;
 
+    /// Sync file contents without requiring unrelated inode metadata to reach stable storage.
+    ///
+    /// The default preserves the stronger [`Self::sync`] contract. File-backed drivers may
+    /// override this with the platform's data-only durability primitive.
+    #[allow(async_fn_in_trait)] // No need for Send
+    async fn sync_data(&self) -> io::Result<()> {
+        self.sync().await
+    }
+
     /// Drop internal buffers.
     ///
     /// This drops all internal buffers, but does not flush them!  All cached data is reloaded on
@@ -433,6 +442,14 @@ pub trait DynStorage: Any + Debug + Display + Send + Sync {
     #[cfg(feature = "sync")]
     fn dyn_sync(&self) -> io::Result<()>;
 
+    /// Object-safe wrapper around [`Storage::sync_data()`].
+    #[cfg(feature = "async")]
+    fn dyn_sync_data(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>>;
+
+    /// Object-safe wrapper around [`Storage::sync_data()`].
+    #[cfg(feature = "sync")]
+    fn dyn_sync_data(&self) -> io::Result<()>;
+
     /// Object-safe wrapper around [`Storage::invalidate_cache()`].
     ///
     /// # Safety
@@ -548,6 +565,10 @@ impl<S: Storage> Storage for &S {
 
     async fn sync(&self) -> io::Result<()> {
         (*self).sync().await
+    }
+
+    async fn sync_data(&self) -> io::Result<()> {
+        (*self).sync_data().await
     }
 
     async unsafe fn invalidate_cache(&self) -> io::Result<()> {
@@ -683,6 +704,16 @@ impl<S: Storage + 'static> DynStorage for S {
     }
 
     #[cfg(feature = "async")]
+    fn dyn_sync_data(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>> {
+        Box::pin(<S as Storage>::sync_data(self))
+    }
+
+    #[cfg(feature = "sync")]
+    fn dyn_sync_data(&self) -> io::Result<()> {
+        <S as Storage>::sync_data(self)
+    }
+
+    #[cfg(feature = "async")]
     unsafe fn dyn_invalidate_cache(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>> {
         Box::pin(unsafe { <S as Storage>::invalidate_cache(self) })
     }
@@ -785,6 +816,10 @@ impl Storage for Box<dyn DynStorage> {
         self.as_ref().dyn_sync().await
     }
 
+    async fn sync_data(&self) -> io::Result<()> {
+        self.as_ref().dyn_sync_data().await
+    }
+
     async unsafe fn invalidate_cache(&self) -> io::Result<()> {
         unsafe { self.as_ref().dyn_invalidate_cache().await }
     }
@@ -868,6 +903,10 @@ impl Storage for Arc<dyn DynStorage> {
 
     async fn sync(&self) -> io::Result<()> {
         self.as_ref().dyn_sync().await
+    }
+
+    async fn sync_data(&self) -> io::Result<()> {
+        self.as_ref().dyn_sync_data().await
     }
 
     async unsafe fn invalidate_cache(&self) -> io::Result<()> {

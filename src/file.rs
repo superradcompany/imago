@@ -410,6 +410,15 @@ impl Storage for File {
 
 #[maybe_async]
 impl File {
+    /// Duplicate the already-open host file backing this storage object.
+    ///
+    /// The returned handle refers to the same opened object rather than resolving the filename
+    /// again. Callers can therefore build an OS-specific asynchronous fast path without creating
+    /// a pathname replacement race between that path and Imago's normal storage operations.
+    pub fn try_clone_file(&self) -> io::Result<fs::File> {
+        self.file.read().unwrap().try_clone()
+    }
+
     /// Central internal function to create a `File` object.
     ///
     /// `direct_io` should be `true` if direct I/O was requested, and can be `false` if that status
@@ -1059,4 +1068,28 @@ mod ioctl {
 
     #[cfg(target_os = "freebsd")]
     ioctl_read!(diocgmediasize, 'd', 129, libc::off_t);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cloned_file_uses_the_open_storage_object() {
+        let source = fs::File::open(file!()).unwrap();
+        let storage = File::try_from(source).unwrap();
+        let cloned = storage.try_clone_file().unwrap();
+
+        assert_eq!(cloned.metadata().unwrap().len(), storage.size().unwrap());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            let original = storage.file.read().unwrap().metadata().unwrap();
+            let duplicate = cloned.metadata().unwrap();
+            assert_eq!(duplicate.dev(), original.dev());
+            assert_eq!(duplicate.ino(), original.ino());
+        }
+    }
 }

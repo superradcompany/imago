@@ -28,6 +28,10 @@ pub struct StorageOpenOptions {
     /// Whether to bypass the host page cache (if applicable).
     pub(crate) direct: bool,
 
+    /// GNU/musl Linux-only: Ask buffered writes not to remain in the host page cache.
+    #[cfg(all(target_os = "linux", any(target_env = "gnu", target_env = "musl")))]
+    pub(crate) write_dontcache: bool,
+
     /// macOS-only: Use fsync() instead of F_FULLFSYNC on `sync()` method.
     #[cfg(target_os = "macos")]
     pub(crate) relaxed_sync: bool,
@@ -767,6 +771,19 @@ impl StorageOpenOptions {
         self
     }
 
+    /// GNU/musl Linux-only: whether buffered writes should avoid remaining in the host page cache.
+    ///
+    /// This is a best-effort per-write hint.  It requires writable, buffered storage and is
+    /// rejected when combined with read-only or direct I/O.  Unsupported kernels and filesystems
+    /// are detected from the write syscall itself, after which writes continue without the hint.
+    /// This hint neither bounds dirty memory nor changes the storage durability contract.
+    /// Dynamically linked GNU builds require glibc 2.26 or newer for `pwritev2()`.
+    #[cfg(all(target_os = "linux", any(target_env = "gnu", target_env = "musl")))]
+    pub fn write_dontcache(mut self, write_dontcache: bool) -> Self {
+        self.write_dontcache = write_dontcache;
+        self
+    }
+
     /// macOS-only: whether to use relaxed synchronization on `File`.
     ///
     /// If relaxed synchronization is enabled, `File::sync()` will use the `fsync()` syscall
@@ -792,6 +809,13 @@ impl StorageOpenOptions {
     /// Return the set direct state.
     pub fn get_direct(&self) -> bool {
         self.direct
+    }
+
+    /// GNU/musl Linux-only: return whether buffered writes should avoid remaining in the host page
+    /// cache.
+    #[cfg(all(target_os = "linux", any(target_env = "gnu", target_env = "musl")))]
+    pub fn get_write_dontcache(&self) -> bool {
+        self.write_dontcache
     }
 
     /// macOS-only: return the relaxed synchronization state.

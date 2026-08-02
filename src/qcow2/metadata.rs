@@ -2850,3 +2850,82 @@ fn encode_binary<T: OnDiskStruct>(val: &T) -> io::Result<Vec<u8>> {
 fn decode_binary<T: OnDiskStruct>(slice: &[u8]) -> io::Result<T> {
     T::load_from(slice)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qcow2_header_codec_matches_fixed_big_endian_layout() {
+        let v2 = V2Header {
+            magic: MAGIC,
+            version: 3,
+            backing_file_offset: 0x0102_0304_0506_0708,
+            backing_file_size: 0x090a_0b0c,
+            cluster_bits: 0x0d0e_0f10,
+            size: AtomicU64::new(0x1112_1314_1516_1718),
+            crypt_method: 0x191a_1b1c,
+            l1_size: AtomicU32::new(0x1d1e_1f20),
+            l1_table_offset: AtomicU64::new(0x2122_2324_2526_2728),
+            refcount_table_offset: AtomicU64::new(0x3132_3334_3536_3738),
+            refcount_table_clusters: AtomicU32::new(0x4142_4344),
+            nb_snapshots: 0x4546_4748,
+            snapshots_offset: 0x5152_5354_5556_5758,
+        };
+        let v2_bytes = encode_binary(&v2).unwrap();
+        assert_eq!(V2Header::ON_DISK_SIZE, 72);
+        assert_eq!(
+            v2_bytes.as_slice(),
+            &[
+                0x51, 0x46, 0x49, 0xfb, 0x00, 0x00, 0x00, 0x03, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
+                0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14,
+                0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20, 0x21, 0x22,
+                0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38,
+                0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56,
+                0x57, 0x58,
+            ]
+        );
+
+        let decoded_v2: V2Header = decode_binary(&v2_bytes).unwrap();
+        assert_eq!(decoded_v2.magic, MAGIC);
+        assert_eq!(decoded_v2.backing_file_offset, 0x0102_0304_0506_0708);
+        assert_eq!(
+            decoded_v2.size.load(Ordering::Relaxed),
+            0x1112_1314_1516_1718
+        );
+        assert_eq!(
+            decoded_v2.l1_table_offset.load(Ordering::Relaxed),
+            0x2122_2324_2526_2728
+        );
+        assert_eq!(decoded_v2.snapshots_offset, 0x5152_5354_5556_5758);
+
+        let v3 = V3HeaderBase {
+            incompatible_features: 0x0102_0304_0506_0708,
+            compatible_features: 0x1112_1314_1516_1718,
+            autoclear_features: 0x2122_2324_2526_2728,
+            refcount_order: 0x3132_3334,
+            header_length: 0x4142_4344,
+        };
+        let v3_bytes = encode_binary(&v3).unwrap();
+        assert_eq!(V3HeaderBase::ON_DISK_SIZE, 32);
+        assert_eq!(
+            v3_bytes.as_slice(),
+            &[
+                0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16,
+                0x17, 0x18, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x31, 0x32, 0x33, 0x34,
+                0x41, 0x42, 0x43, 0x44,
+            ]
+        );
+
+        let extension = HeaderExtensionHeader {
+            extension_type: 0x0102_0304,
+            length: 0x1112_1314,
+        };
+        let extension_bytes = encode_binary(&extension).unwrap();
+        assert_eq!(HeaderExtensionHeader::ON_DISK_SIZE, 8);
+        assert_eq!(
+            extension_bytes.as_slice(),
+            &[0x01, 0x02, 0x03, 0x04, 0x11, 0x12, 0x13, 0x14]
+        );
+    }
+}

@@ -998,8 +998,15 @@ impl HeaderExtension {
                     HeaderExtension::BackingFileFormat(fmt)
                 }
                 HeaderExtensionType::FeatureNameTable => {
+                    if !data.len().is_multiple_of(48) {
+                        return Err(invalid_data(format!(
+                            "Invalid feature name table length {}; must be a multiple of 48",
+                            data.len(),
+                        )));
+                    }
+
                     let mut feats = HashMap::new();
-                    for feat in data.chunks(48) {
+                    for feat in data.chunks_exact(48) {
                         let feat_type: FeatureType = match feat[0].try_into() {
                             Ok(ft) => ft,
                             Err(_) => continue, // skip unrecognized entries
@@ -2854,6 +2861,47 @@ fn decode_binary<T: OnDiskStruct>(slice: &[u8]) -> io::Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn feature_name_table_rejects_partial_entries() {
+        for length in 1usize..96 {
+            if length.is_multiple_of(48) {
+                continue;
+            }
+
+            let result = HeaderExtension::deserialize(
+                HeaderExtensionType::FeatureNameTable as u32,
+                vec![0; length],
+            );
+            assert!(
+                matches!(result, Err(ref err) if err.kind() == io::ErrorKind::InvalidData),
+                "accepted a partial feature name table entry of {length} bytes: {result:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn feature_name_table_accepts_complete_entries() {
+        let mut data = vec![0; 48];
+        data[0] = FeatureType::Compatible as u8;
+        data[1] = 7;
+        data[2..6].copy_from_slice(b"test");
+
+        let extension =
+            HeaderExtension::deserialize(HeaderExtensionType::FeatureNameTable as u32, data)
+                .unwrap()
+                .unwrap();
+        let HeaderExtension::FeatureNameTable(features) = extension else {
+            panic!("feature name table decoded as the wrong extension type");
+        };
+
+        assert_eq!(
+            features
+                .get(&(FeatureType::Compatible, 7))
+                .map(String::as_str),
+            Some("test"),
+        );
+    }
 
     #[test]
     fn qcow2_header_codec_matches_fixed_big_endian_layout() {

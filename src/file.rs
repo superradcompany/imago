@@ -34,6 +34,13 @@ use windows_sys::Win32::System::Ioctl::{FILE_ZERO_DATA_INFORMATION, FSCTL_SET_ZE
 #[cfg(windows)]
 use windows_sys::Win32::System::IO::DeviceIoControl;
 
+/// Linux UAPI value for `RWF_DONTCACHE`.
+///
+/// Keeping the stable UAPI bit here avoids raising Imago's minimum `libc` crate version solely
+/// for a newly exposed constant. Both supported Linux libc targets already expose `pwritev2()`.
+#[cfg(all(target_os = "linux", any(target_env = "gnu", target_env = "musl")))]
+const RWF_DONTCACHE_FLAG: libc::c_int = 0x0000_0080;
+
 /// Use a plain file or host block device as a storage object.
 #[derive(Debug)]
 pub struct File {
@@ -67,6 +74,13 @@ pub struct File {
     #[cfg(target_os = "macos")]
     relaxed_sync: bool,
 
+    /// GNU/musl Linux-only: Whether to try `RWF_DONTCACHE` for buffered writes.
+    ///
+    /// The flag is cleared permanently after the kernel or filesystem reports the hint as
+    /// unsupported, avoiding repeated failed syscalls while preserving ordinary buffered writes.
+    #[cfg(all(target_os = "linux", any(target_env = "gnu", target_env = "musl")))]
+    write_dontcache: AtomicBool,
+
     /// Set once we know that discard is unsupported and we can skip trying.
     discard_unsupported: AtomicBool,
 }
@@ -84,6 +98,8 @@ impl TryFrom<fs::File> for File {
         Self::new(
             file,
             None,
+            false,
+            #[cfg(all(target_os = "linux", any(target_env = "gnu", target_env = "musl")))]
             false,
             #[cfg(target_os = "macos")]
             false,
@@ -231,6 +247,40 @@ impl Storage for File {
                 .try_into()
                 .map_err(|_| io::Error::other("Write offset overflow"))?;
 
+            #[cfg(all(target_os = "linux", any(target_env = "gnu", target_env = "musl")))]
+            let len = write_with_optional_dontcache(
+                &self.write_dontcache,
+                || {
+                    // Safe: The descriptor and iovec remain valid for the duration of the call;
+                    // the offset was checked above and the flag has no pointer arguments.
+                    syscall_result(unsafe {
+                        libc::pwritev2(
+                            self.file.read().unwrap().as_raw_fd(),
+                            iovec.as_ptr(),
+                            iovec.len() as libc::c_int,
+                            pwritev_offset,
+                            RWF_DONTCACHE_FLAG,
+                        )
+                    })
+                },
+                || {
+                    // This fallback receives the exact same unconsumed iovec and offset.  It is
+                    // used only when the kernel explicitly rejects `RWF_DONTCACHE`.
+                    syscall_result(unsafe {
+                        libc::pwritev(
+                            self.file.read().unwrap().as_raw_fd(),
+                            iovec.as_ptr(),
+                            iovec.len() as libc::c_int,
+                            pwritev_offset,
+                        )
+                    })
+                },
+            )?;
+
+            #[cfg(all(
+                unix,
+                not(all(target_os = "linux", any(target_env = "gnu", target_env = "musl")))
+            ))]
             let len = while_eintr(|| unsafe {
                 libc::pwritev(
                     self.file.read().unwrap().as_raw_fd(),
@@ -238,12 +288,9 @@ impl Storage for File {
                     iovec.len() as libc::c_int,
                     pwritev_offset,
                 )
-            })? as u64;
+            })?;
 
-            if len == 0 {
-                // Should not happen, i.e. is an error
-                return Err(io::ErrorKind::WriteZero.into());
-            }
+            let len = require_write_progress(len)?;
 
             bufv = bufv.split_tail_at(len);
             offset = offset
@@ -411,6 +458,8 @@ impl File {
         mut file: fs::File,
         filename: Option<PathBuf>,
         direct_io: bool,
+        #[cfg(all(target_os = "linux", any(target_env = "gnu", target_env = "musl")))]
+        write_dontcache: bool,
         #[cfg(target_os = "macos")] relaxed_sync: bool,
     ) -> io::Result<Self> {
         let size = get_file_size(&file).err_context(|| "Failed to determine file size")?;
@@ -455,6 +504,8 @@ impl File {
             common_storage_helper: Default::default(),
             #[cfg(target_os = "macos")]
             relaxed_sync,
+            #[cfg(all(target_os = "linux", any(target_env = "gnu", target_env = "musl")))]
+            write_dontcache: AtomicBool::new(write_dontcache),
             discard_unsupported: AtomicBool::new(false),
         })
     }
@@ -725,6 +776,22 @@ impl File {
 
     /// Implementation for anything that opens a file.
     fn do_open_sync(opts: StorageOpenOptions, base_fs_opts: fs::OpenOptions) -> io::Result<Self> {
+        #[cfg(all(target_os = "linux", any(target_env = "gnu", target_env = "musl")))]
+        if opts.write_dontcache && !opts.writable {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "RWF_DONTCACHE requires writable storage",
+            ));
+        }
+
+        #[cfg(all(target_os = "linux", any(target_env = "gnu", target_env = "musl")))]
+        if opts.write_dontcache && opts.direct {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "RWF_DONTCACHE is incompatible with direct I/O",
+            ));
+        }
+
         let Some(filename) = opts.filename else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -758,6 +825,8 @@ impl File {
             file,
             Some(filename_owned),
             opts.direct,
+            #[cfg(all(target_os = "linux", any(target_env = "gnu", target_env = "musl")))]
+            opts.write_dontcache,
             #[cfg(target_os = "macos")]
             opts.relaxed_sync,
         )
@@ -960,6 +1029,82 @@ impl Display for File {
     }
 }
 
+/// Convert a successful vectored-write result into observable forward progress.
+#[cfg(unix)]
+fn require_write_progress(length: libc::ssize_t) -> io::Result<u64> {
+    if length == 0 {
+        Err(io::ErrorKind::WriteZero.into())
+    } else {
+        debug_assert!(length > 0);
+        Ok(length as u64)
+    }
+}
+
+/// Turn a Linux vectored-write syscall return value into an I/O result.
+#[cfg(all(target_os = "linux", any(target_env = "gnu", target_env = "musl")))]
+fn syscall_result(result: libc::ssize_t) -> io::Result<libc::ssize_t> {
+    if result == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(result)
+    }
+}
+
+/// Retry an I/O operation only when it was interrupted before making observable progress.
+#[cfg(any(
+    all(target_os = "linux", any(target_env = "gnu", target_env = "musl")),
+    all(test, unix)
+))]
+fn retry_interrupted<F>(mut operation: F) -> io::Result<libc::ssize_t>
+where
+    F: FnMut() -> io::Result<libc::ssize_t>,
+{
+    loop {
+        match operation() {
+            Err(error) if error.raw_os_error() == Some(libc::EINTR) => continue,
+            result => return result,
+        }
+    }
+}
+
+/// Try a `RWF_DONTCACHE` write and fall back only when that hint is unsupported.
+///
+/// Both operations are supplied by the caller so an unsupported hinted write can be retried with
+/// the ordinary syscall using the exact same unconsumed iovec and offset.  All other errors,
+/// including `EINVAL`, remain visible to the caller rather than silently changing I/O semantics.
+#[cfg(any(
+    all(target_os = "linux", any(target_env = "gnu", target_env = "musl")),
+    all(test, unix)
+))]
+fn write_with_optional_dontcache<H, P>(
+    write_dontcache: &AtomicBool,
+    hinted_write: H,
+    plain_write: P,
+) -> io::Result<libc::ssize_t>
+where
+    H: FnMut() -> io::Result<libc::ssize_t>,
+    P: FnMut() -> io::Result<libc::ssize_t>,
+{
+    if !write_dontcache.load(Ordering::Relaxed) {
+        return retry_interrupted(plain_write);
+    }
+
+    match retry_interrupted(hinted_write) {
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS)
+            ) =>
+        {
+            // Kernel and filesystem support are authoritative.  Once either rejects the flag,
+            // future writes avoid paying for another syscall that is known not to work.
+            write_dontcache.store(false, Ordering::Relaxed);
+            retry_interrupted(plain_write)
+        }
+        result => result,
+    }
+}
+
 /// Get total size in bytes of the given file.
 ///
 /// If the file is a block or character device, use get_device_size() instead of
@@ -1037,4 +1182,134 @@ mod ioctl {
 
     #[cfg(target_os = "freebsd")]
     ioctl_read!(diocgmediasize, 'd', 129, libc::off_t);
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    use std::cell::Cell;
+
+    #[cfg(all(target_os = "linux", any(target_env = "gnu", target_env = "musl")))]
+    #[test]
+    fn write_dontcache_options_default_to_disabled() {
+        let options = StorageOpenOptions::new();
+        assert!(!options.get_write_dontcache());
+
+        let options = options.write_dontcache(true);
+        assert!(options.get_write_dontcache());
+    }
+
+    #[cfg(all(target_os = "linux", any(target_env = "gnu", target_env = "musl")))]
+    #[test]
+    fn write_dontcache_rejects_read_only_files() {
+        let options = StorageOpenOptions::new().write_dontcache(true);
+        let error = File::do_open_sync(options, fs::OpenOptions::new()).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("writable storage"));
+    }
+
+    #[cfg(all(target_os = "linux", any(target_env = "gnu", target_env = "musl")))]
+    #[test]
+    fn write_dontcache_rejects_direct_io() {
+        let options = StorageOpenOptions::new()
+            .write(true)
+            .direct(true)
+            .write_dontcache(true);
+        let error = File::do_open_sync(options, fs::OpenOptions::new()).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("direct I/O"));
+    }
+
+    #[test]
+    fn unsupported_hint_retries_the_same_tail_and_disables_future_hints() {
+        for unsupported_error in [libc::EOPNOTSUPP, libc::ENOSYS] {
+            let enabled = AtomicBool::new(true);
+            let hinted_calls = Cell::new(0);
+            let plain_calls = Cell::new(0);
+
+            let length = write_with_optional_dontcache(
+                &enabled,
+                || {
+                    hinted_calls.set(hinted_calls.get() + 1);
+                    if hinted_calls.get() == 1 {
+                        Err(io::Error::from_raw_os_error(libc::EINTR))
+                    } else {
+                        Err(io::Error::from_raw_os_error(unsupported_error))
+                    }
+                },
+                || {
+                    plain_calls.set(plain_calls.get() + 1);
+                    Ok(37)
+                },
+            )
+            .unwrap();
+
+            assert_eq!(length, 37);
+            assert_eq!(hinted_calls.get(), 2);
+            assert_eq!(plain_calls.get(), 1);
+            assert!(!enabled.load(Ordering::Relaxed));
+
+            let length = write_with_optional_dontcache(
+                &enabled,
+                || panic!("a disabled hint must not be retried"),
+                || {
+                    plain_calls.set(plain_calls.get() + 1);
+                    Ok(11)
+                },
+            )
+            .unwrap();
+
+            assert_eq!(length, 11);
+            assert_eq!(plain_calls.get(), 2);
+        }
+    }
+
+    #[test]
+    fn invalid_hint_error_does_not_fall_back() {
+        let enabled = AtomicBool::new(true);
+        let plain_calls = Cell::new(0);
+
+        let error = write_with_optional_dontcache(
+            &enabled,
+            || Err(io::Error::from_raw_os_error(libc::EINVAL)),
+            || {
+                plain_calls.set(plain_calls.get() + 1);
+                Ok(1)
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
+        assert_eq!(plain_calls.get(), 0);
+        assert!(enabled.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn successful_partial_hint_write_advances_without_fallback() {
+        let enabled = AtomicBool::new(true);
+        let plain_calls = Cell::new(0);
+
+        let length = write_with_optional_dontcache(
+            &enabled,
+            || Ok(13),
+            || {
+                plain_calls.set(plain_calls.get() + 1);
+                Ok(99)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(length, 13);
+        assert_eq!(plain_calls.get(), 0);
+        assert!(enabled.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn zero_length_write_is_write_zero() {
+        let error = require_write_progress(0).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WriteZero);
+    }
 }

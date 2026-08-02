@@ -3,10 +3,9 @@
 use super::types::*;
 use crate::io_buffers::IoBuffer;
 use crate::macros::numerical_enum;
+use crate::macros::on_disk_struct::{on_disk_struct, OnDiskStruct};
 use crate::misc_helpers::invalid_data;
 use crate::{Storage, StorageExt};
-use bincode::config::{BigEndian, Configuration as BincodeConfiguration, Fixint};
-use bincode::{Decode, Encode};
 use std::collections::HashMap;
 use std::mem::size_of;
 use std::num::TryFromIntError;
@@ -40,30 +39,25 @@ pub(super) const MIN_REFCOUNT_WIDTH: usize = 1;
 /// Maximum number of bits per refcount entry.
 pub(super) const MAX_REFCOUNT_WIDTH: usize = 64;
 
-/// Bincode configuration for the qcow2 integer format
-const BINCODE_CFG: BincodeConfiguration<BigEndian, Fixint> = bincode::config::standard()
-    .with_fixed_int_encoding()
-    .with_big_endian();
-
+on_disk_struct! {
 /// Qcow2 v2 header.
-#[derive(Decode, Encode)]
-struct V2Header {
+struct V2Header/BE, no_gaps {
     /// Qcow magic string ("QFI\xfb").
-    magic: u32,
+    magic: u32[0],
 
     /// Version number (valid values are 2 and 3).
-    version: u32,
+    version: u32[4],
 
     /// Offset into the image file at which the backing file name is stored (NB: The string is not
     /// null terminated).  0 if the image doesn’t have a backing file.
     ///
     /// Note: backing files are incompatible with raw external data files (auto-clear feature bit
     /// 1).
-    backing_file_offset: u64,
+    backing_file_offset: u64[8],
 
     /// Length of the backing file name in bytes.  Must not be longer than 1023 bytes.  Undefined
     /// if the image doesn’t have a backing file.
-    backing_file_size: u32,
+    backing_file_size: u32[16],
 
     /// Number of bits that are used for addressing an offset within a cluster (`1 << cluster_bits`
     /// is the cluster size).  Must not be less than 9 (i.e. 512 byte clusters).
@@ -73,7 +67,7 @@ struct V2Header {
     ///
     /// Note: if the image has Extended L2 Entries then `cluster_bits` must be at least 14 (i.e.
     /// 16384 byte clusters).
-    cluster_bits: u32,
+    cluster_bits: u32[20],
 
     /// Virtual disk size in bytes.
     ///
@@ -82,45 +76,41 @@ struct V2Header {
     /// byte cluster size, it is unable to populate a virtual size larger than 128 GB (37 bits).
     /// Meanwhile, L1/L2 table layouts limit an image to no more than 64 PB (56 bits) of populated
     /// clusters, and an image may hit other limits first (such as a file system’s maximum size).
-    size: AtomicU64,
+    size: AtomicU64[24],
 
     /// Encryption method:
     ///
     /// 0. no encryption
     /// 1. AES encryption
     /// 2. LUKS encryption
-    crypt_method: u32,
+    crypt_method: u32[32],
 
     /// Number of entries in the active L1 table.
-    l1_size: AtomicU32,
+    l1_size: AtomicU32[36],
 
     /// Offset into the image file at which the active L1 table starts.  Must be aligned to a
     /// cluster boundary.
-    l1_table_offset: AtomicU64,
+    l1_table_offset: AtomicU64[40],
 
     /// Offset into the image file at which the refcount table starts.  Must be aligned to a
     /// cluster boundary.
-    refcount_table_offset: AtomicU64,
+    refcount_table_offset: AtomicU64[48],
 
     /// Number of clusters that the refcount table occupies.
-    refcount_table_clusters: AtomicU32,
+    refcount_table_clusters: AtomicU32[56],
 
     /// Number of snapshots contained in the image.
-    nb_snapshots: u32,
+    nb_snapshots: u32[60],
 
     /// Offset into the image file at which the snapshot table starts.  Must be aligned to a
     /// cluster boundary.
-    snapshots_offset: u64,
+    snapshots_offset: u64[64],
+}
 }
 
-impl V2Header {
-    /// Raw v2 header length.
-    const RAW_SIZE: usize = 72;
-}
-
+on_disk_struct! {
 /// Qcow2 v3 header.
-#[derive(Decode, Encode)]
-struct V3HeaderBase {
+struct V3HeaderBase/BE, no_gaps {
     /// Bitmask of incompatible features.  An implementation must fail to open an image if an
     /// unknown bit is set.
     ///
@@ -141,7 +131,7 @@ struct V3HeaderBase {
     ///    details.
     ///
     /// Bits 5-63 are reserved (set to 0).
-    incompatible_features: u64,
+    incompatible_features: u64[0],
 
     /// Bitmask of compatible features.  An implementation can safely ignore any unknown bits that
     /// are set.
@@ -150,7 +140,7 @@ struct V3HeaderBase {
     ///    means marking the image file dirty and postponing refcount metadata updates.
     ///
     /// Bits 1-63 are reserved (set to 0).
-    compatible_features: u64,
+    compatible_features: u64[8],
 
     /// Bitmask of auto-clear features.  An implementation may only write to an image with unknown
     /// auto-clear features if it clears the respective bits from this field first.
@@ -167,21 +157,17 @@ struct V3HeaderBase {
     ///    bit (incompatible feature bit 1) is also set.
     ///
     /// Bits 2-63 are reserved (set to 0).
-    autoclear_features: u64,
+    autoclear_features: u64[16],
 
     /// Describes the width of a reference count block entry (width in bits: `refcount_bits = 1 <<
     /// refcount_order`).  For version 2 images, the order is always assumed to be 4 (i.e.
     /// `refcount_bits = 16`).  This value may not exceed 6 (i.e. `refcount_bits = 64`).
-    refcount_order: u32,
+    refcount_order: u32[24],
 
     /// Length of the header structure in bytes.  For version 2 images, the length is always
     /// assumed to be 72 bytes.  For version 3 it’s at least 104 bytes and must be a multiple of 8.
-    header_length: u32,
+    header_length: u32[28],
 }
-
-impl V3HeaderBase {
-    /// Raw v3 header length beyond the v2 header.
-    const RAW_SIZE: usize = 104 - V2Header::RAW_SIZE;
 }
 
 impl Default for V3HeaderBase {
@@ -191,7 +177,7 @@ impl Default for V3HeaderBase {
             compatible_features: 0,
             autoclear_features: 0,
             refcount_order: 4,
-            header_length: (V2Header::RAW_SIZE + V3HeaderBase::RAW_SIZE) as u32,
+            header_length: (V2Header::ON_DISK_SIZE + V3HeaderBase::ON_DISK_SIZE) as u32,
         }
     }
 }
@@ -269,19 +255,16 @@ numerical_enum! {
     }
 }
 
+on_disk_struct! {
 /// Header for a header extension.
-#[derive(Default, Decode, Encode)]
-struct HeaderExtensionHeader {
+#[derive(Default)]
+struct HeaderExtensionHeader/BE, no_gaps {
     /// Type code of the header extension.
-    extension_type: u32,
+    extension_type: u32[0],
 
     /// Data length.
-    length: u32,
+    length: u32[4],
 }
-
-impl HeaderExtensionHeader {
-    /// Raw struct length.
-    const RAW_SIZE: usize = 8;
 }
 
 numerical_enum! {
@@ -342,7 +325,7 @@ impl Header {
     /// If `writable` is false, do not perform any modifications (e.g. clearing auto-clear bits).
     pub async fn load<S: Storage>(image: &S, writable: bool) -> io::Result<Self> {
         // TODO: More sanity checks.
-        let mut header_buf = vec![0u8; V2Header::RAW_SIZE];
+        let mut header_buf = vec![0u8; V2Header::ON_DISK_SIZE];
         image.read(header_buf.as_mut_slice(), 0).await?;
 
         let header: V2Header = decode_binary(&header_buf)?;
@@ -353,9 +336,9 @@ impl Header {
         let v3header_base = if header.version == 2 {
             V3HeaderBase::default()
         } else if header.version == 3 {
-            let mut header_buf = vec![0u8; V3HeaderBase::RAW_SIZE];
+            let mut header_buf = vec![0u8; V3HeaderBase::ON_DISK_SIZE];
             image
-                .read(header_buf.as_mut_slice(), V2Header::RAW_SIZE as u64)
+                .read(header_buf.as_mut_slice(), V2Header::ON_DISK_SIZE as u64)
                 .await?;
             decode_binary(&header_buf)?
         } else {
@@ -374,7 +357,7 @@ impl Header {
             )));
         }
 
-        let min_header_size = V2Header::RAW_SIZE + V3HeaderBase::RAW_SIZE;
+        let min_header_size = V2Header::ON_DISK_SIZE + V3HeaderBase::ON_DISK_SIZE;
         if (v3header_base.header_length as usize) < min_header_size {
             return Err(invalid_data(format!(
                 "qcow2 header too short: {} < {min_header_size}",
@@ -456,14 +439,14 @@ impl Header {
             let mut ext_offset: u64 = v3header_base.header_length as u64;
             let mut extensions = Vec::<HeaderExtension>::new();
             loop {
-                if ext_offset + HeaderExtensionHeader::RAW_SIZE as u64 > cluster_size as u64 {
+                if ext_offset + HeaderExtensionHeader::ON_DISK_SIZE as u64 > cluster_size as u64 {
                     return Err(invalid_data("Header extensions exceed the first cluster"));
                 }
 
-                let mut ext_hdr_buf = vec![0; HeaderExtensionHeader::RAW_SIZE];
+                let mut ext_hdr_buf = vec![0; HeaderExtensionHeader::ON_DISK_SIZE];
                 image.read(&mut ext_hdr_buf, ext_offset).await?;
 
-                ext_offset += HeaderExtensionHeader::RAW_SIZE as u64;
+                ext_offset += HeaderExtensionHeader::ON_DISK_SIZE as u64;
 
                 let ext_hdr: HeaderExtensionHeader = decode_binary(&ext_hdr_buf)?;
                 let ext_end = ext_offset
@@ -563,14 +546,13 @@ impl Header {
     /// Write the qcow2 header to disk.
     pub async fn write<S: Storage>(&mut self, image: &S) -> io::Result<()> {
         let header_len = if self.v2.version > 2 {
-            let len = encoded_size(&self.v2).unwrap()
-                + encoded_size(&self.v3).unwrap()
-                + self.unknown_header_fields.len();
+            let len =
+                self.v2.on_disk_size() + self.v3.on_disk_size() + self.unknown_header_fields.len();
             let len = len.next_multiple_of(8);
             self.v3.header_length = len as u32;
             len
         } else {
-            V2Header::RAW_SIZE
+            V2Header::ON_DISK_SIZE
         };
 
         // If the header gets too long, try to remove the feature name table to make it small
@@ -2857,32 +2839,93 @@ fn check_table(
     Ok(())
 }
 
-/// Helper function replacing `bincode::serialized_size()`.
-///
-/// This function has not yet been implemented in bincode 2.
-fn encoded_size<E: Encode>(val: E) -> io::Result<usize> {
-    let mut length = bincode::enc::write::SizeWriter::default();
-    bincode::encode_into_writer(val, &mut length, BINCODE_CFG)
-        .map_err(|err| invalid_data(err.to_string()))?;
-    Ok(length.bytes_written)
-}
-
-/// Helper function replacing `bincode::encode_to_vec()`.
-///
-/// Bincode provides an `encode_to_vec()` function, but only under the `alloc` feature.  For some
-/// reason, enabling that feature pulls in a serde dependency, so re-implement it here.
-fn encode_binary<E: Encode>(val: &E) -> io::Result<Vec<u8>> {
-    let mut vec = vec![0; encoded_size(val)?];
-    bincode::encode_into_slice(val, &mut vec, BINCODE_CFG)
-        .map_err(|err| invalid_data(err.to_string()))?;
+/// Return a byte buffer for `val`.
+fn encode_binary<T: OnDiskStruct>(val: &T) -> io::Result<Vec<u8>> {
+    let mut vec = vec![0; T::ON_DISK_SIZE];
+    val.store_to(&mut vec)?;
     Ok(vec)
 }
 
-/// Helper function wrapping `bincode::decode_from_slice()`.
-///
-/// We already have [`encode_binary()`] as a helper, we might as well have a helper for decoding.
-fn decode_binary<D: Decode<()>>(slice: &[u8]) -> io::Result<D> {
-    bincode::decode_from_slice(slice, BINCODE_CFG)
-        .map(|(result, _)| result)
-        .map_err(|err| invalid_data(err.to_string()))
+/// Decode `T` from the given byte buffer.
+fn decode_binary<T: OnDiskStruct>(slice: &[u8]) -> io::Result<T> {
+    T::load_from(slice)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qcow2_header_codec_matches_fixed_big_endian_layout() {
+        let v2 = V2Header {
+            magic: MAGIC,
+            version: 3,
+            backing_file_offset: 0x0102_0304_0506_0708,
+            backing_file_size: 0x090a_0b0c,
+            cluster_bits: 0x0d0e_0f10,
+            size: AtomicU64::new(0x1112_1314_1516_1718),
+            crypt_method: 0x191a_1b1c,
+            l1_size: AtomicU32::new(0x1d1e_1f20),
+            l1_table_offset: AtomicU64::new(0x2122_2324_2526_2728),
+            refcount_table_offset: AtomicU64::new(0x3132_3334_3536_3738),
+            refcount_table_clusters: AtomicU32::new(0x4142_4344),
+            nb_snapshots: 0x4546_4748,
+            snapshots_offset: 0x5152_5354_5556_5758,
+        };
+        let v2_bytes = encode_binary(&v2).unwrap();
+        assert_eq!(V2Header::ON_DISK_SIZE, 72);
+        assert_eq!(
+            v2_bytes.as_slice(),
+            &[
+                0x51, 0x46, 0x49, 0xfb, 0x00, 0x00, 0x00, 0x03, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
+                0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14,
+                0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20, 0x21, 0x22,
+                0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38,
+                0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56,
+                0x57, 0x58,
+            ]
+        );
+
+        let decoded_v2: V2Header = decode_binary(&v2_bytes).unwrap();
+        assert_eq!(decoded_v2.magic, MAGIC);
+        assert_eq!(decoded_v2.backing_file_offset, 0x0102_0304_0506_0708);
+        assert_eq!(
+            decoded_v2.size.load(Ordering::Relaxed),
+            0x1112_1314_1516_1718
+        );
+        assert_eq!(
+            decoded_v2.l1_table_offset.load(Ordering::Relaxed),
+            0x2122_2324_2526_2728
+        );
+        assert_eq!(decoded_v2.snapshots_offset, 0x5152_5354_5556_5758);
+
+        let v3 = V3HeaderBase {
+            incompatible_features: 0x0102_0304_0506_0708,
+            compatible_features: 0x1112_1314_1516_1718,
+            autoclear_features: 0x2122_2324_2526_2728,
+            refcount_order: 0x3132_3334,
+            header_length: 0x4142_4344,
+        };
+        let v3_bytes = encode_binary(&v3).unwrap();
+        assert_eq!(V3HeaderBase::ON_DISK_SIZE, 32);
+        assert_eq!(
+            v3_bytes.as_slice(),
+            &[
+                0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16,
+                0x17, 0x18, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x31, 0x32, 0x33, 0x34,
+                0x41, 0x42, 0x43, 0x44,
+            ]
+        );
+
+        let extension = HeaderExtensionHeader {
+            extension_type: 0x0102_0304,
+            length: 0x1112_1314,
+        };
+        let extension_bytes = encode_binary(&extension).unwrap();
+        assert_eq!(HeaderExtensionHeader::ON_DISK_SIZE, 8);
+        assert_eq!(
+            extension_bytes.as_slice(),
+            &[0x01, 0x02, 0x03, 0x04, 0x11, 0x12, 0x13, 0x14]
+        );
+    }
 }

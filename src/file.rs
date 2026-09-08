@@ -879,7 +879,7 @@ impl File {
 
     /// Attempt to discard range by truncating the file.
     ///
-    /// If the given range is at the end of the file, discard it by simply truncating the file.
+    /// If the range reaches the end of the file, truncate and restore the original file length.
     /// Return `true` on success.
     ///
     /// If the range is not at the end of the file, i.e. another method of discarding is needed,
@@ -903,6 +903,8 @@ impl File {
         }
 
         file.set_len(offset)?;
+        // Release the tail without changing the disk capacity seen after reopening the image.
+        file.set_len(size)?;
         Ok(true)
     }
 
@@ -1311,5 +1313,57 @@ mod tests {
     fn zero_length_write_is_write_zero() {
         let error = require_write_progress(0).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::WriteZero);
+    }
+}
+
+#[cfg(test)]
+mod tail_discard_tests {
+    use super::File;
+    use crate::{Storage, StorageExt, StorageOpenOptions};
+    use std::{fs, io};
+
+    // Keep cleanup alive until all storage handles have been dropped, including on assertion failure.
+    struct TempPath(std::path::PathBuf);
+
+    impl Drop for TempPath {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    #[test]
+    fn tail_discard_keeps_file_length() -> io::Result<()> {
+        let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+        runtime.block_on(async {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "msb-imago-tail-discard-{}-{unique}.raw",
+                std::process::id()
+            ));
+            let _temp_path = TempPath(path.clone());
+            fs::write(&path, vec![0xabu8; 8192])?;
+
+            let file = File::open(StorageOpenOptions::new().write(true).filename(&path)).await?;
+            file.discard(4096, 4096).await?;
+            assert_eq!(fs::metadata(&path)?.len(), 8192);
+            assert_eq!(file.size()?, 8192);
+
+            let mut prefix = vec![0u8; 4096];
+            file.read(&mut prefix, 0).await?;
+            assert_eq!(prefix, vec![0xabu8; 4096]);
+
+            let mut tail = vec![0xffu8; 4096];
+            file.read(&mut tail, 4096).await?;
+            assert!(tail.iter().all(|&byte| byte == 0));
+
+            // Reopening must discover the same capacity, rather than relying on the cached size.
+            drop(file);
+            let reopened = File::open(StorageOpenOptions::new().filename(&path)).await?;
+            assert_eq!(reopened.size()?, 8192);
+            Ok(())
+        })
     }
 }

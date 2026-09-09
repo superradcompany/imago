@@ -1,6 +1,6 @@
 [package]
 name = "msb-imago"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 license = "MIT"
 description = "A library for accessing virtual machine disk images."
@@ -18,7 +18,7 @@ nix = { version = "0.30", features = ["ioctl"] }
 page_size = "0.6"
 tokio = { version = "1", features = ["sync"] }
 tracing = { version = "0.1", features = ["attributes"] }
-vm-memory = { package = "msb-vm-memory", version = "=0.18.0-msb.1", optional = true, default-features = false }
+vm-memory = { package = "msb-vm-memory", version = "=0.18.0-msb.2", optional = true, default-features = false }
 
 # For build.rs
 [build-dependencies]

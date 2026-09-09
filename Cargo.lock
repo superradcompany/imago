@@ -54,7 +54,7 @@ dependencies = [
 
 [[package]]
 name = "msb-imago"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "cfg-if",
@@ -71,9 +71,9 @@ dependencies = [
 
 [[package]]
 name = "msb-vm-memory"
-version = "0.18.0-msb.1"
+version = "0.18.0-msb.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c31dfbf17e640f6d661ae17e098b87c019821fe3eb4aba0e9eeada4ba678096"
+checksum = "6646492f6bc51c4126c73854d377ba8ce4cebb1443cc9efe2517ab2215d87b49"
 dependencies = [
  "thiserror",
 ]
